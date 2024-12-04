@@ -1,0 +1,6 @@
+__pycache__/
+.venv/
+
+api_dump.json
+config.json
+known_grades.json
