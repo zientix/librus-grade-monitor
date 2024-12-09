@@ -1,292 +1,373 @@
 import asyncio
 import json
 import os
-import time
-from typing import Dict, List, Set, Optional
+from typing import Dict, List, Set
 from datetime import datetime
-from librus import Librus
-import smtplib
+import aiosmtplib  # Using aiosmtplib for async email sending
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from librus import Librus
+from pathlib import Path
+import logging
+import sys
 
-class Config:
-    def __init__(self, config_file='config.json'):
-        self.config_file = config_file
-        self.librus_login = ""
-        self.librus_password = ""
-        self.gmail_address = ""
-        self.gmail_app_password = ""  # App password, not your regular Gmail password
-        self.notification_email = ""   # Where to send notifications
-        self.check_interval = 300      # 5 minutes default
+# This program automatically monitors your Librus grades and sends email notifications
+# when new grades are added. It's made to work with Polish characters and has a nice
+# email formatting. Just set it up once and forget about constantly checking Librus! 
 
-    def load(self):
-        """Load configuration from file"""
+class UTFStreamHandler(logging.StreamHandler):
+    """
+    Custom handler for console logging that properly handles Polish characters.
+    Makes sure everything prints nicely in your terminal!
+    """
+    def emit(self, record):
         try:
-            if os.path.exists(self.config_file):
-                with open(self.config_file, 'r') as f:
-                    data = json.load(f)
-                    self.librus_login = data.get('librus_login', '')
-                    self.librus_password = data.get('librus_password', '')
-                    self.gmail_address = data.get('gmail_address', '')
-                    self.gmail_app_password = data.get('gmail_app_password', '')
-                    self.notification_email = data.get('notification_email', '')
-                    self.check_interval = data.get('check_interval', 300)
+            msg = self.format(record)
+            stream = self.stream
+            stream.buffer.write(msg.encode('utf-8'))
+            stream.buffer.write(self.terminator.encode('utf-8'))
+            self.flush()
+        except Exception:
+            self.handleError(record)
+
+class UTFFileHandler(logging.FileHandler):
+    """
+    Custom handler for file logging that saves logs with Polish characters correctly.
+    Your log files will be readable and won't have weird symbols!
+    """
+    def __init__(self, filename, mode='a', encoding='utf-8', delay=False):
+        super().__init__(filename, mode, encoding, delay)
+
+# Setting up logging so we can see what's happening with our program
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        UTFStreamHandler(sys.stdout),
+        UTFFileHandler('monitor.log', encoding='utf-8')
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class ConfigManager:
+    """
+    Manages all your settings like login, password, and email info.
+    Saves everything securely in a config file so you don't have to
+    type it in every time you run the program.
+    """
+    def __init__(self, config_path: str = 'config.json'):
+        self.path = Path(config_path)
+        self.config: Dict = {
+            'librus_login': '',
+            'librus_password': '',
+            'gmail_address': '',
+            'gmail_app_password': '',
+            'notification_email': '',
+            'check_interval': 300  # 5 minutes by default
+        }
+
+    def load(self) -> bool:
+        """
+        Loads your saved settings from the config file.
+        Returns True if successful, False if something goes wrong.
+        """
+        try:
+            if self.path.exists():
+                self.config = json.loads(self.path.read_text(encoding='utf-8'))
                 return True
+            logger.warning("No configuration file found")
+            return False
         except Exception as e:
-            print(f"Error loading configuration: {e}")
-        return False
+            logger.error(f"Failed to load configuration: {e}")
+            return False
 
-    def save(self):
-        """Save configuration to file"""
+    def save(self) -> bool:
+        """
+        Saves your settings to the config file.
+        Returns True if successful, False if something goes wrong.
+        """
         try:
-            with open(self.config_file, 'w') as f:
-                json.dump({
-                    'librus_login': self.librus_login,
-                    'librus_password': self.librus_password,
-                    'gmail_address': self.gmail_address,
-                    'gmail_app_password': self.gmail_app_password,
-                    'notification_email': self.notification_email,
-                    'check_interval': self.check_interval
-                }, f, indent=4)
-            print("Configuration saved successfully")
+            self.path.write_text(
+                json.dumps(self.config, indent=4, ensure_ascii=False),
+                encoding='utf-8'
+            )
             return True
         except Exception as e:
-            print(f"Error saving configuration: {e}")
-        return False
+            logger.error(f"Failed to save configuration: {e}")
+            return False
 
-    def setup(self):
-        """Interactive configuration setup"""
+    def setup(self) -> bool:
+        """
+        Walks you through setting up the program for the first time.
+        Asks for your Librus login, Gmail info, and how often to check for grades.
+        """
         print("\nLibrus Grade Monitor Configuration")
-        print("---------------------------------")
+        print("-" * 35)
         
-        # Librus credentials
-        self.librus_login = input("Enter your Librus login: ").strip()
-        self.librus_password = input("Enter your Librus password: ").strip()
-        
-        # Gmail configuration
-        print("\nGmail Configuration (for sending notifications)")
-        print("Note: You need to use an App Password, not your regular Gmail password!")
-        print("To create one, go to: Google Account -> Security -> 2-Step Verification -> App passwords")
-        self.gmail_address = input("Enter your Gmail address: ").strip()
-        self.gmail_app_password = input("Enter your Gmail App Password: ").strip()
-        self.notification_email = input("Enter email where you want to receive notifications: ").strip()
-        
-        # Check interval
         try:
-            interval = input("Enter check interval in minutes (default 5): ").strip()
-            if interval:
-                self.check_interval = int(interval) * 60
-        except ValueError:
-            print("Invalid interval, using default (5 minutes)")
-            self.check_interval = 300
-        
-        return self.save()
-# ... (previous Config class remains the same)
+            self.config['librus_login'] = input("Librus login: ").strip()
+            self.config['librus_password'] = input("Librus password: ").strip()
+            
+            print("\nEmail Configuration")
+            print("Note: Use Gmail App Password, not regular password")
+            print("Create one at: Google Account -> Security -> 2-Step Verification -> App passwords")
+            
+            self.config['gmail_address'] = input("Gmail address: ").strip()
+            self.config['gmail_app_password'] = input("Gmail App Password: ").strip()
+            self.config['notification_email'] = input("Notification email address: ").strip()
+            
+            interval = input("Check interval in minutes (default 5): ").strip()
+            self.config['check_interval'] = int(interval) * 60 if interval else 300
+            
+            return self.save()
+        except Exception as e:
+            logger.error(f"Configuration setup failed: {e}")
+            return False
 
-class GradeMonitor:
-    def __init__(self):
-        self.config = Config()
+class EmailSender:
+    """
+    Handles sending nice-looking email notifications about your new grades.
+    Makes sure Polish characters show up correctly in emails!
+    """
+    def __init__(self, config: Dict):
+        self.config = config
+
+    async def send_email(self, subject: str, content: str) -> bool:
+        """
+        Sends an email with your grade info.
+        Makes a pretty HTML version and a plain text version of the email.
+        """
+        try:
+            message = MIMEMultipart('alternative')
+            message['From'] = self.config['gmail_address']
+            message['To'] = self.config['notification_email']
+            message['Subject'] = subject
+
+            # Making a nice-looking HTML email
+            html_content = f"""
+            <!DOCTYPE html>
+            <html lang="pl">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <style>
+                    @import url('https://fonts.googleapis.com/css2?family=Jaro:opsz@6..72&display=swap');
+                    body {{ font-family: Jaro, sans-serif; line-height: 1.6; }}
+                    .grade-info {{  background: linear-gradient(to right, #8360c3, #2ebf91); font-size: 2.5em; padding: 15px; border-radius: 5px; color: #ffffff; }}
+                </style>
+            </head>
+            <body>
+                <div class="grade-info">
+                    {content.replace('\n', '<br>')}
+                </div>
+            </body>
+            </html>
+            """
+
+            message.attach(MIMEText(content, 'plain', 'utf-8'))
+            message.attach(MIMEText(html_content, 'html', 'utf-8'))
+
+            # Sending the email through Gmail
+            await aiosmtplib.send(
+                message,
+                hostname="smtp.gmail.com",
+                port=465,
+                use_tls=True,
+                username=self.config['gmail_address'],
+                password=self.config['gmail_app_password']
+            )
+            
+            logger.info(f"Email sent to {self.config['notification_email']}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to send email: {e}")
+            return False
+
+class GradeTracker:
+    """
+    Keeps track of which grades we've already seen.
+    This way you only get notifications for new grades!
+    """
+    def __init__(self, known_grades_path: str = 'known_grades.json'):
+        self.path = Path(known_grades_path)
         self.known_grades: Set[int] = set()
+
+    def load(self) -> None:
+        """Loads the list of grades we've already notified you about"""
+        try:
+            if self.path.exists():
+                content = self.path.read_text(encoding='utf-8').strip()
+                if content:
+                    self.known_grades = set(json.loads(content))
+        except Exception as e:
+            logger.error(f"Failed to load known grades: {e}")
+            self.known_grades = set()
+
+    def save(self) -> None:
+        """Saves the list of grades we've seen so far"""
+        try:
+            self.path.write_text(
+                json.dumps(list(self.known_grades), ensure_ascii=False),
+                encoding='utf-8'
+            )
+        except Exception as e:
+            logger.error(f"Failed to save known grades: {e}")
+
+class LibrusMonitor:
+    """
+    The main part of the program that checks Librus for new grades
+    and sends you notifications. It puts everything together!
+    """
+    def __init__(self):
+        self.config_manager = ConfigManager()
+        self.grade_tracker = GradeTracker()
         self.librus = Librus(None)
+        self.email_sender = None
         self.api_data: Dict = {}
-        self.subjects: Dict[int, str] = {}
-        self.categories: Dict[int, Dict] = {}
-        self.teachers: Dict[int, Dict] = {}
 
-    def load_api_data(self):
-        """Load API data from dump file"""
+    def load_api_data(self) -> None:
+        """
+        Loads extra info about your subjects and teachers
+        so notifications can show proper names instead of IDs
+        """
         try:
-            with open('api_dump.json', 'r', encoding='utf-8') as f:
-                self.api_data = json.load(f)
-                
-            # Extract subjects
-            if 'Subjects' in self.api_data:
-                for subject in self.api_data['Subjects'].get('Subjects', []):
-                    self.subjects[subject['Id']] = subject['Name']
-                    
-            # Extract grade categories
-            if 'Grades/Categories' in self.api_data:
-                for category in self.api_data['Grades/Categories'].get('Categories', []):
-                    self.categories[category['Id']] = {
-                        'name': category['Name'],
-                        'weight': category.get('Weight', 'none')
-                    }
-                    
-            # Extract teachers
-            if 'Users' in self.api_data:
-                for user in self.api_data['Users'].get('Users', []):
-                    self.teachers[user['Id']] = {
-                        'first_name': user['FirstName'],
-                        'last_name': user['LastName']
-                    }
-                    
-            print("Successfully loaded API data")
-        except FileNotFoundError:
-            print("Warning: api_dump.json not found. Will use IDs instead of names.")
+            api_dump_path = Path('api_dump.json')
+            if api_dump_path.exists():
+                self.api_data = json.loads(api_dump_path.read_text(encoding='utf-8'))
+                logger.info("API data loaded successfully")
         except Exception as e:
-            print(f"Error loading API data: {e}")
-
-    def load_known_grades(self):
-        """Load previously seen grades from file"""
-        try:
-            if os.path.exists('known_grades.json'):
-                with open('known_grades.json', 'r') as f:
-                    content = f.read().strip()
-                    if content:  # Only try to parse if file is not empty
-                        self.known_grades = set(json.loads(content))
-                    else:
-                        print("Known grades file is empty, starting fresh.")
-                        self.known_grades = set()
-            else:
-                print("No previous grades file found, starting fresh.")
-                self.known_grades = set()
-        except json.JSONDecodeError:
-            print("Error reading known grades file, starting fresh.")
-            self.known_grades = set()
-            # Remove corrupted file
-            if os.path.exists('known_grades.json'):
-                os.remove('known_grades.json')
-        except Exception as e:
-            print(f"Unexpected error loading known grades: {e}, starting fresh.")
-            self.known_grades = set()
-        
-    def save_known_grades(self):
-        """Save currently known grades to file"""
-        try:
-            with open('known_grades.json', 'w') as f:
-                json.dump(list(self.known_grades), f)
-        except Exception as e:
-            print(f"Error saving known grades: {e}")
-
-    def send_email(self, subject: str, content: str):
-        """Send email notification using Gmail"""
-        try:
-            msg = MIMEMultipart()
-            msg['From'] = self.config.gmail_address
-            msg['To'] = self.config.notification_email
-            msg['Subject'] = subject
-
-            msg.attach(MIMEText(content, 'plain'))
-
-            server = smtplib.SMTP_SSL('smtp.gmail.com', 465)
-            server.login(self.config.gmail_address, self.config.gmail_app_password)
-            server.send_message(msg)
-            server.quit()
-            print(f"Email notification sent to {self.config.notification_email}")
-        except Exception as e:
-            print(f"Error sending email: {e}")
-
-    def get_teacher_name(self, teacher_id: int) -> str:
-        if teacher_id in self.teachers:
-            teacher = self.teachers[teacher_id]
-            return f"{teacher['first_name']} {teacher['last_name']}"
-        return f"Teacher ID: {teacher_id}"
-
-    def get_category_info(self, category_id: int) -> str:
-        if category_id in self.categories:
-            category = self.categories[category_id]
-            weight = f" (weight: {category['weight']})" if category['weight'] != 'none' else ""
-            return f"{category['name']}{weight}"
-        return f"Category ID: {category_id}"
+            logger.error(f"Failed to load API data: {e}")
+            self.api_data = {}
 
     def format_grade_info(self, grade: Dict) -> str:
-        date = datetime.strptime(grade["AddDate"], "%Y-%m-%d %H:%M:%S").strftime("%Y-%m-%d %H:%M")
-        subject_name = self.subjects.get(grade['Subject']['Id'], f"Subject ID: {grade['Subject']['Id']}")
-        teacher_name = self.get_teacher_name(grade['AddedBy']['Id'])
-        category_info = self.get_category_info(grade['Category']['Id'])
-        
-        grade_info = [
-            f"New grade in {subject_name}",
-            f"Grade: {grade['Grade']}",
-            f"Category: {category_info}",
-            f"Added by: {teacher_name}",
-            f"Date: {date}"
-        ]
-        
-        if grade['IsSemester'] or grade['IsSemesterProposition']:
-            grade_info.append("Type: Semester grade")
-        elif grade['IsFinal'] or grade['IsFinalProposition']:
-            grade_info.append("Type: Final grade")
+        """
+        Makes your grade notifications look nice and readable.
+        Shows subject name, grade, category, teacher, and date.
+        """
+        try:
+            date = datetime.strptime(grade["AddDate"], "%Y-%m-%d %H:%M:%S").strftime("%Y-%m-%d %H:%M")
             
-        if 'Improvement' in grade:
-            grade_info.append("This is an improvement grade")
-        if 'Resit' in grade:
-            grade_info.append("This is a resit grade")
-            
-        return "\n".join(grade_info)
+            # Getting the subject name
+            subject_id = grade['Subject']['Id']
+            subjects_data = self.api_data.get('Subjects', {}).get('Subjects', [])
+            subject_name = next(
+                (s['Name'] for s in subjects_data if s['Id'] == subject_id),
+                f"Subject ID: {subject_id}"
+            )
 
-    async def get_current_grades(self) -> List[Dict]:
+            # Getting the teacher name
+            teacher_id = grade['AddedBy']['Id']
+            teacher = next(
+                (u for u in self.api_data.get('Users', {}).get('Users', [])
+                 if u['Id'] == teacher_id),
+                {'FirstName': 'Unknown', 'LastName': f'Teacher (ID: {teacher_id})'}
+            )
+            
+            # Getting the grade category and weight
+            category_id = grade['Category']['Id']
+            category = next(
+                (c for c in self.api_data.get('Grades/Categories', {}).get('Categories', [])
+                 if c['Id'] == category_id),
+                {'Name': f'Category {category_id}', 'Weight': 'N/A'}
+            )
+
+            grade_info = [
+                f"Przedmiot: {subject_name}",
+                f"Ocena: {grade['Grade']}",
+                f"Kategoria: {category['Name']} (waga: {category.get('Weight', 'N/A')})",
+                f"Nauczyciel: {teacher['FirstName']} {teacher['LastName']}",
+                f"Data: {date}"
+            ]
+
+            if grade.get('Comments'):
+                grade_info.append("Komentarz dodany do oceny")
+
+            return "\n".join(grade_info)
+        except Exception as e:
+            logger.error(f"Failed to format grade info: {e}")
+            return str(grade)
+
+    async def check_for_updates(self) -> None:
+        """
+        Checks Librus for new grades and sends you an email
+        if there's anything new to report!
+        """
         try:
             response = await self.librus.get_data("Grades")
-            if response and "Grades" in response:
-                return response["Grades"]
-        except Exception as e:
-            print(f"Error fetching grades: {e}")
-        return []
-
-    async def check_for_updates(self):
-        current_grades = await self.get_current_grades()
-        
-        for grade in current_grades:
-            grade_id = grade["Id"]
-            if grade_id not in self.known_grades:
-                grade_info = self.format_grade_info(grade)
-                print("\nNEW GRADE DETECTED!")
-                print("-" * 50)
-                print(grade_info)
-                if "Comments" in grade:
-                    print("This grade has a comment attached")
-                print("-" * 50)
-                
-                # Send email notification
-                subject_name = self.subjects.get(grade['Subject']['Id'], f"Subject ID: {grade['Subject']['Id']}")
-                self.send_email(
-                    f"New Grade in {subject_name}",
-                    grade_info + "\n\nThis notification was sent by Librus Grade Monitor"
-                )
-                
-                self.known_grades.add(grade_id)
-        
-        self.save_known_grades()
-
-    async def run(self):
-        print("Starting Librus grade monitor...")
-        
-        # Load or setup configuration
-        if not self.config.load():
-            if not self.config.setup():
-                print("Failed to setup configuration!")
+            if not response or "Grades" not in response:
                 return
-        
+
+            for grade in response["Grades"]:
+                grade_id = grade["Id"]
+                if grade_id not in self.grade_tracker.known_grades:
+                    grade_info = self.format_grade_info(grade)
+                    logger.info(f"New grade detected:\n{grade_info}")
+                    
+                    subject_id = grade['Subject']['Id']
+                    subjects_data = self.api_data.get('Subjects', {}).get('Subjects', [])
+                    subject_name = next(
+                        (s['Name'] for s in subjects_data if s['Id'] == subject_id),
+                        f"Subject {subject_id}"
+                    )
+                    
+                    await self.email_sender.send_email(
+                        f"Nowa ocena - {subject_name}",
+                        grade_info
+                    )
+                    
+                    self.grade_tracker.known_grades.add(grade_id)
+                    self.grade_tracker.save()
+
+        except Exception as e:
+            logger.error(f"Error checking for updates: {e}")
+
+    async def run(self) -> None:
+        """
+        Starts up the monitor and keeps it running.
+        This is what keeps checking for your grades!
+        """
+        logger.info("Starting Librus grade monitor...")
+
+        # Load or setup configuration
+        if not self.config_manager.load():
+            if not self.config_manager.setup():
+                logger.error("Failed to setup configuration!")
+                return
+
+        # Get everything ready
+        self.email_sender = EmailSender(self.config_manager.config)
         self.load_api_data()
-        
-        # Use credentials from config
-        if not await self.librus.mktoken(self.config.librus_login, self.config.librus_password):
-            print("Authentication failed!")
+        self.grade_tracker.load()
+
+        # Log into Librus
+        if not await self.librus.mktoken(
+            self.config_manager.config['librus_login'],
+            self.config_manager.config['librus_password']
+        ):
+            logger.error("Authentication failed!")
             return
 
-        print(f"\nSuccessfully authenticated. Checking for updates every {self.config.check_interval} seconds...")
-        print("Press Ctrl+C to stop")
+        logger.info(f"Monitor running. Checking every {self.config_manager.config['check_interval']} seconds")
         
-        # Test email
-        self.send_email("Grade Monitor Started", 
-                       "The Librus grade monitoring service is now active")
-        
-        self.load_known_grades()
-        
-        while True:
-            try:
+        # Let you know the monitor started
+        await self.email_sender.send_email(
+            "Monitor Librus uruchomiony",
+            "System monitorowania ocen został uruchomiony"
+        )
+
+        try:
+            while True:
                 await self.check_for_updates()
-                await asyncio.sleep(self.config.check_interval)
-            except KeyboardInterrupt:
-                print("\nStopping monitor...")
-                self.send_email("Grade Monitor Stopped", 
-                              "The Librus grade monitoring service has been stopped")
-                break
-            except Exception as e:
-                print(f"Error occurred: {e}")
-                await asyncio.sleep(self.config.check_interval)
+                await asyncio.sleep(self.config_manager.config['check_interval'])
+        except KeyboardInterrupt:
+            logger.info("Shutting down monitor...")
+            await self.email_sender.send_email(
+                "Monitor Librus zatrzymany",
+                "System monitorowania ocen został zatrzymany"
+            )
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
 
 if __name__ == "__main__":
-    monitor = GradeMonitor()
+    monitor = LibrusMonitor()
     asyncio.run(monitor.run())
